@@ -31,11 +31,25 @@ on:
         description: "Build args for frontend image (newline-separated KEY=VALUE)"
         type: string
         default: ""
+      frontend_context:
+        description: "Build context for frontend image"
+        type: string
+        default: "./frontend"
+      deploy_user:
+        description: "SSH user on the deploy target"
+        type: string
+        default: "root"
+      tailscale:
+        description: "Connect to Tailscale before deploying (for private hosts)"
+        type: boolean
+        default: false
     secrets:
       DEPLOY_SSH_KEY:
         required: true
       GHCR_TOKEN:
         required: true
+      TAILSCALE_AUTHKEY:
+        required: false
 
 env:
   REGISTRY: ghcr.io
@@ -106,7 +120,7 @@ jobs:
       - name: Build and push frontend
         uses: docker/build-push-action@v5
         with:
-          context: ./frontend
+          context: ${{ inputs.frontend_context }}
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
@@ -161,11 +175,17 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Connect to Tailscale
+        if: ${{ inputs.tailscale }}
+        uses: tailscale/github-action@v3
+        with:
+          authkey: ${{ secrets.TAILSCALE_AUTHKEY }}
+
       - name: Copy compose file to server
         uses: appleboy/scp-action@v0.1.7
         with:
           host: ${{ vars.DEPLOY_HOST }}
-          username: root
+          username: ${{ inputs.deploy_user }}
           key: ${{ secrets.DEPLOY_SSH_KEY }}
           source: ${{ inputs.compose_file }}
           target: "~/${{ inputs.app_name }}/"
@@ -180,7 +200,7 @@ jobs:
           GHCR_TOKEN: ${{ secrets.GHCR_TOKEN }}
         with:
           host: ${{ vars.DEPLOY_HOST }}
-          username: root
+          username: ${{ inputs.deploy_user }}
           key: ${{ secrets.DEPLOY_SSH_KEY }}
           envs: APP_NAME,BACKEND_TYPE,RUN_MIGRATIONS,COMPOSE_FILE,GHCR_TOKEN
           script: |
