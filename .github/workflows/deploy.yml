@@ -1,0 +1,215 @@
+name: Deploy to Production
+
+on:
+  workflow_call:
+    inputs:
+      app_name:
+        description: "Application name (e.g. coastal, music, betteraltea)"
+        required: true
+        type: string
+      has_frontend:
+        description: "Whether the app has a frontend to build"
+        type: boolean
+        default: true
+      has_sidecar:
+        description: "Whether the app has a sidecar service to build"
+        type: boolean
+        default: false
+      backend_type:
+        description: "Backend framework: elixir or python"
+        type: string
+        default: "elixir"
+      run_migrations:
+        description: "Run database migrations after deploy"
+        type: boolean
+        default: true
+      compose_file:
+        description: "Docker compose filename in the repo"
+        type: string
+        default: "docker-compose.yml"
+    secrets:
+      DEPLOY_SSH_KEY:
+        required: true
+      GHCR_TOKEN:
+        required: true
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_PREFIX: ghcr.io/bigfancygarden/${{ inputs.app_name }}
+
+jobs:
+  build-backend:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.IMAGE_PREFIX }}/api
+          tags: |
+            type=raw,value=latest
+            type=sha,prefix=sha-,format=short
+
+      - name: Build and push backend
+        uses: docker/build-push-action@v5
+        with:
+          context: ./backend
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  build-frontend:
+    if: ${{ inputs.has_frontend }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.IMAGE_PREFIX }}/frontend
+          tags: |
+            type=raw,value=latest
+            type=sha,prefix=sha-,format=short
+
+      - name: Build and push frontend
+        uses: docker/build-push-action@v5
+        with:
+          context: ./frontend
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  build-sidecar:
+    if: ${{ inputs.has_sidecar }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.IMAGE_PREFIX }}/sidecar
+          tags: |
+            type=raw,value=latest
+            type=sha,prefix=sha-,format=short
+
+      - name: Build and push sidecar
+        uses: docker/build-push-action@v5
+        with:
+          context: ./sidecar
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  deploy:
+    needs:
+      - build-backend
+      - build-frontend
+      - build-sidecar
+    if: ${{ always() && needs.build-backend.result == 'success' && (needs.build-frontend.result == 'success' || needs.build-frontend.result == 'skipped') && (needs.build-sidecar.result == 'success' || needs.build-sidecar.result == 'skipped') }}
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Copy compose file to server
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host: ${{ vars.DEPLOY_HOST }}
+          username: root
+          key: ${{ secrets.DEPLOY_SSH_KEY }}
+          source: ${{ inputs.compose_file }}
+          target: "~/${{ inputs.app_name }}/"
+
+      - name: Deploy
+        uses: appleboy/ssh-action@v1
+        env:
+          APP_NAME: ${{ inputs.app_name }}
+          BACKEND_TYPE: ${{ inputs.backend_type }}
+          RUN_MIGRATIONS: ${{ inputs.run_migrations }}
+          COMPOSE_FILE: ${{ inputs.compose_file }}
+          GHCR_TOKEN: ${{ secrets.GHCR_TOKEN }}
+        with:
+          host: ${{ vars.DEPLOY_HOST }}
+          username: root
+          key: ${{ secrets.DEPLOY_SSH_KEY }}
+          envs: APP_NAME,BACKEND_TYPE,RUN_MIGRATIONS,COMPOSE_FILE,GHCR_TOKEN
+          script: |
+            set -e
+            cd ~/${APP_NAME}
+
+            # Authenticate with GHCR
+            echo "${GHCR_TOKEN}" | docker login ghcr.io -u bigfancygarden --password-stdin
+
+            # Pull latest images and recreate containers
+            docker compose -f ${COMPOSE_FILE} pull
+            docker compose -f ${COMPOSE_FILE} up -d --force-recreate --remove-orphans
+
+            # Run migrations
+            if [ "${RUN_MIGRATIONS}" = "true" ]; then
+              if [ "${BACKEND_TYPE}" = "elixir" ]; then
+                MODULE=$(echo "${APP_NAME}" | awk '{print toupper(substr($0,1,1)) substr($0,2)}')
+                docker exec ${APP_NAME}-api /app/bin/${APP_NAME} eval "${MODULE}.Release.migrate()"
+              elif [ "${BACKEND_TYPE}" = "python" ]; then
+                docker exec ${APP_NAME}-api alembic upgrade head
+              fi
+            fi
+
+            # Health check with retries
+            echo "Waiting for ${APP_NAME}-api to be healthy..."
+            for i in $(seq 1 5); do
+              if [ "${BACKEND_TYPE}" = "elixir" ]; then
+                docker exec ${APP_NAME}-api /app/bin/${APP_NAME} pid && echo "Health check passed" && break
+              elif [ "${BACKEND_TYPE}" = "python" ]; then
+                docker exec ${APP_NAME}-api curl -sf http://localhost:8000/api/health && echo "Health check passed" && break
+              fi
+              echo "Attempt ${i}/5 failed, retrying in 3s..."
+              sleep 3
+            done
+
+            # Cleanup old images
+            docker image prune -f
