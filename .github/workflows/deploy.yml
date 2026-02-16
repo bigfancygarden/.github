@@ -27,6 +27,10 @@ on:
         description: "Docker compose filename in the repo"
         type: string
         default: "docker-compose.yml"
+      frontend_build_args:
+        description: "Build args for frontend image (newline-separated KEY=VALUE)"
+        type: string
+        default: ""
     secrets:
       DEPLOY_SSH_KEY:
         required: true
@@ -106,6 +110,7 @@ jobs:
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+          build-args: ${{ inputs.frontend_build_args }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
